@@ -1,4 +1,7 @@
 import asyncio
+from email.header import make_header
+import random
+from sre_parse import FLAGS
 from tcputils import *
 
 
@@ -37,6 +40,20 @@ class Servidor:
             conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao)
             # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
             # fazer aqui mesmo ou dentro da classe Conexao.
+            conexao.seq_no = random.randint(0, 50000)
+            conexao.ack_no = seq_no + 1
+
+            handshake = make_header(
+                dst_port,
+                src_port,
+                conexao.seq_no,
+                conexao.ack_no,
+                FLAGS_SYN | FLAGS_ACK
+            )
+
+            self.rede.enviar(fix_checksum(handshake, dst_addr, src_addr), src_addr)
+            conexao.seq_no += 1 #Atualiza o número de sequência, pois o servidor responde com um número y != de conexao.seq_no (gerado aleatoriamente)
+
             if self.callback:
                 self.callback(conexao)
         elif id_conexao in self.conexoes:
@@ -45,6 +62,7 @@ class Servidor:
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
+     
 
 
 class Conexao:
@@ -54,6 +72,8 @@ class Conexao:
         self.callback = None
         self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
         #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
+        self.seq_no = 0
+        self.ack_no = 0
 
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
@@ -63,7 +83,27 @@ class Conexao:
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
-        print('recebido payload: %r' % payload)
+        #Tratando fechamento da conexão
+        dst_addr, dst_port, src_addr, src_port = self.id_conexao
+        if (flags & FLAGS_FIN) == FLAGS_FIN:
+            # print('encerrando conexao')
+            payload = b''
+            self.callback(self, payload)
+            self.ack_no += 1
+            sndpkt = fix_checksum(make_header(src_port, dst_port, self.seq_no, self.ack_no, FLAGS_ACK), src_addr, dst_addr)
+            self.servidor.rede.enviar(sndpkt, dst_addr)
+
+        elif len(payload) <= 0:
+            return
+        else:
+            if self.ack_no != seq_no: #se ack_no
+                return 
+            # print(f'JOAO ack_no:{ack_no}, seq_no:{seq_no}, self.seq_no:{self.seq_no}, self.ack_no:{self.ack_no}')
+            self.callback(self, payload)
+            self.ack_no+=len(payload)
+            sndpkt = fix_checksum(make_header(src_port, dst_port, self.seq_no, self.ack_no, FLAGS_ACK), src_addr, dst_addr)
+            self.servidor.rede.enviar(sndpkt, dst_addr)
+            print('recebido payload: %r' % payload)
 
     # Os métodos abaixo fazem parte da API
 
@@ -81,11 +121,34 @@ class Conexao:
         # TODO: implemente aqui o envio de dados.
         # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
         # que você construir para a camada de rede.
-        pass
+        dst_addr, dst_port, src_addr, src_port = self.id_conexao
+        # print(f'len(dados):{len(dados)}, MSS:{MSS}')
+        vezes_maior = int(len(dados)/MSS) #numero de vezes que os dados são maior que o tamanho do segmento
+        counter = 0
+        if len(dados) > MSS: #se os dados não cabem em um unico pacote
+            while(counter < vezes_maior):
+                pos_inicial = counter*MSS
+                pos_final = (counter+1)*MSS
+                dados_quebrados = dados[pos_inicial:pos_final]
+                segmento = fix_checksum(make_header(src_port, dst_port, self.seq_no, self.ack_no, 0 | FLAGS_ACK)+dados_quebrados, src_addr, dst_addr)
+                self.servidor.rede.enviar(segmento, dst_addr)
+                self.seq_no += len(dados_quebrados)
+                counter += 1        
+                # print('entrou1')
+        else:
+            # print('entrou2')
+            segmento = fix_checksum(make_header(src_port, dst_port, self.seq_no, self.ack_no, 0 | FLAGS_ACK)+dados, src_addr, dst_addr)
+            self.servidor.rede.enviar(segmento, dst_addr)
+            self.seq_no += len(dados)
 
+  
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
         # TODO: implemente aqui o fechamento de conexão
-        pass
+        dst_addr, dst_port, src_addr, src_port = self.id_conexao
+        segmento = make_header(src_port, dst_port, self.seq_no, self.ack_no, FLAGS_FIN)
+        segmento_correto = fix_checksum(segmento, src_addr, dst_addr)
+        self.servidor.rede.enviar(segmento_correto, dst_addr)
+        self.ack_no += 1
